@@ -1,0 +1,8 @@
+
+
+create_namespace 'iwt'
+hbase(main):005:0> list_namespace 'iwt'
+hbase(main):006:0> create 'iwt:hbasedemo', 'cf1'
+hbase(main):007:0> list_namespace_tables 'iwt'
+TABLE
+hbasedemo
