@@ -1,0 +1,16 @@
+create EXTERNAL table hr_hive (empid int,fname string,lname string,city string,state string)
+STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
+WITH SERDEPROPERTIES
+("hbase.columns.mapping" = ":key,employee:fname,employee:lname,employee:city,employee:state")
+TBLPROPERTIES ("hbase.table.name" = "hr");
+
+
+create EXTERNAL table hr_hive_source (empid int,fname string,lname string,city string,state string)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '|'
+LOCATION '/user/anjaiahspr/hivehbase/data_hr/';
+10|Anji|MM|HYD|AP
+INSERT INTO table tablename1 select columnlist FROM secondtable;
+INSERT INTO table hr_hive select * FROM hr_hive_source;
+set hive.cli.print.header=true;
+select * from hr_hive
