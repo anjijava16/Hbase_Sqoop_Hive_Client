@@ -1,0 +1,17 @@
+   Hbase ==>
+(100% Data Sync)
+i) ==> NM <<==>> DD1,DD2,DD3
+1 Record NM ===> DD1,DD2,DD3
+
+
+NM (HMaster) ===> DD (HRegionServers ==>region)
+
+Cass
+
+MemorStore (Temp (or) Cache)
+Fluse
+HFile/ HDFS
+
+https://community.cloudera.com/t5/Storage-Random-Access-HDFS/HBase-region-servers-giving-org-apache-hadoop-hbase/td-p/59582
+
+http://gbif.blogspot.com/2012/07/optimizing-writes-in-hbase.html
