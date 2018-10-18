@@ -1,0 +1,88 @@
+Optimizing Writes in HBase
+I've written a few times about our work to improve the scanning performance of our cluster (parts 1, 2, and 3) since our highest priority for HBase is being able to serve requests for downloads of occurrence records (which require a full table scan). But now that the scanning is working nicely we need to start writing new records into our occurrence table as well as cleaning raw data and interpreting it into something more useful for the users of our data portal. That processing is built as Hive queries that read from and write back to the same HBase table. And while it was working fine on small test datasets, it all blew up once I moved the process to the full dataset. Here's what happened and how we fixed it. Note that we're using CDH3u3, with the addition of Hive 0.9.0, which we patched to support HBase 0.90.4.
+
+The problem
+Our processing is Hive queries which run as Hadoop MapReduce jobs. When the mappers were running they would eventually fail (repeatedly, ultimately killing the job) with an error that looks like this:
+
+java.io.IOException: org.apache.hadoop.hbase.client.ScannerTimeoutException: 63882ms passed since the last invocation, timeout is currently set to 60000
+
+We did some digging and found that this exception happens when the scanner's next() method hasn't been called within the timeout limit. We simplified our test case by reproducing this same error when doing a simple CopyTable operation (the one that ships with HBase), and again using Hive to do select overwrite table A select * from table B. In both cases mappers are assigned a split to scan based on TableInputFormat (just like our Hive jobs), and as they scan they simply put the record out to the new table. Something is holding up the loop as it tries to put, preventing it from calling next(), and thereby triggering the timeout exception.
+
+The logs
+First stop - the logs. The regionservers are littered with lines like the following:
+
+WARN org.apache.hadoop.hbase.regionserver.MemStoreFlusher: Region occurrence,\x17\xF1o\x9C,1340981109494.ecb85155563c6614e5448c7d700b909e. has too many store files; delaying flush up to 90000ms
+INFO org.apache.hadoop.hbase.regionserver.HRegion: Blocking updates for 'IPC Server handler 7 on 60020' on region occurrence,\x17\xF1o\x9C,1340981109494.ecb85155563c6614e5448c7d700b909e.: memstore size 128.2m is >= than blocking 128.0m size
+
+Well, blocking updates sure sounds like the kind of thing that would prevent a loop from writing more puts and dutifully calling next(). After a little more digging (and testing with a variety of hbase.client.scanner.caching values, including 1) we concluded that yes, this was the problem, but why was it happening?
+
+Why it blocks
+It blocks because the memstore has hit what I'll call the "memstore blocking limit" which is controlled by the setting hbase.hregion.memstore.flush.size * hbase.hregion.memstore.block.multiplier, which by default are 64MB and 2 respectively. Normally the memstore should flush when it reaches the flush.size, but in this case it reaches 128MB because it's not allowed to flush due to too many store files (the first log line). The definition of "too many storefiles" is in turn a setting, namely hbase.hstore.blockingStoreFiles (default 7). A new store file is created every time the memstore flushes, and their number is reduced by compacting them into fewer, bigger storefiles during minor and major compactions. By default, compactions will only start if there are at least hbase.hstore.compactionThreshold (default 3) store files, and won't compact more than hbase.hstore.compaction.max (default 7) in a single compaction. And regardless of what you set flush.size to, the memstore will always flush if all memstores in the regionserver combined are using too much heap.  The acceptable levels of heap usage are defined by hbase.regionserver.global.memstore.lowerLimit (default 0.35) and hbase.regionserver.global.memstore.upperLimit (default 0.4). There is a thread dedicated to flushing that wakes up regularly and checks these limits:
+
+if the flush thread wakes up and memstores are greater than the lower limit it will start flushing (starting with current biggest memstore) until it gets below the limit.
+if flush thread wakes up and memstores are greater than the upper limit it will block updates and start flushing until it gets under lower limit, when it unblocks updates.
+Fortunately we didn't see blocking because of the upper heap limit - only the "memstore blocking limit" described earlier. But at this point we only knew the different dials we could turn.
+
+Stopping the blocking
+Our goal is to stop the blocking so that our mapper doesn't timeout, while at the same time not running out of memory on the regionserver. The most obvious problem is that we have too many storefiles, which appears to be a combination of producing too many of them and not compacting them fast enough. Note that we have a 6GB heap dedicated to HBase, but can't afford to take any more away from the co-resident Hadoop mappers and reducers.
+
+We started by upping the memstore flush size - this will produce fewer but bigger storefiles on each flush:
+first we tried 128MB with block multiplier still at 2. This still produced too many storefiles and caused the same blocking (maybe a little better than at 64MB)
+then tried 256MB with multiplier of 4.  The logs and ganglia showed that the flushes were happening well before 256MB (still around 130MB) "due to global heap pressure" - a sign that total memstores were consuming too much heap. This meant we were still generating too many files and got the same blocking problem, but with the "memstore blocking limit" set to 1GB the memstore blocking happened much less often, and later in the process (still killed the mappers though)
+We were now producing fewer storefiles, but they were still accumulating too quickly. From ganglia we also saw that the compaction queue and storefile counts were growing unbounded, which meant we'd hit the blocking limit again eventually. Next came trying to compact more files per compaction, hence raised compaction.max to 20, and this made little difference.
+
+So how to reduce the number of storefiles? If we had fewer stores, we'd be creating fewer files and using up less heap for memstore, so next we increased the region size.  This meant increasing the setting hbase.hregion.max.filesize from its default of 256MB to 1.5G, and then rebuilding our table with fewer pre-split regions.  That resulted in about 75% fewer regions.
+
+It was starting to look good - the number of "Blocking updates" log messages dropped to a handful per run, but it was still enough to affect one or two jobs to the point of them getting killed.  We tried upping the memstore.lowerLimit and upperLimit to 0.45 and 0.5 respectively, but again no joy.
+
+Now what?
+Things looked kind of grim. After endless poring over ganglia charts, we kept coming back to one unexplained blip that seemed to coincide with the start of the storefile explosion that eventually killed the jobs.
+
+Figure 1: Average memstore flush size over time
+At about the halfway point of the jobs the size of memstore flushes would spike and then gradually increase until the job died. Keep in mind that the chart shows averages, and it only took a few of those flushes to wait for storefiles long enough to fill to 1GB and then start the blocking that was our undoing. Back to the logs.
+
+From the start of Figure 1 we can see that things appear to be going smoothly - the memstores are flushing at or just above 256MB, which means they have enough heap and are doing their jobs. From the logs we see the flushes happening fine, but there are regular lines like the following:
+INFO org.apache.hadoop.hbase.regionserver.MemStoreFlusher: Under global heap pressure: Region uat_occurrence,\x06\x0E\xAC\x0F,1341574060728.ab7fed6ea92842941f97cb9384ec3d4b. has too many store files, but is 625.1m vs best flushable region's 278.2m. Choosing the bigger.
+This isn't quite as bad as the "delaying flush" line, but it shows that we're on the limit of what our heap can handle. Then starting from around 12:20 we see more and more like the following:
+WARN org.apache.hadoop.hbase.regionserver.MemStoreFlusher: Region uat_occurrence,"\x98=\x1C,1341567129447.a3a6557c609ad7fc38815fdcedca6c26. has too many store files; delaying flush up to 90000ms
+and then to top it off:
+INFO org.apache.hadoop.hbase.regionserver.wal.HLog: Too many hlogs: logs=35, maxlogs=32; forcing flush of 1 regions(s): ab7fed6ea92842941f97cb9384ec3d4b
+INFO org.apache.hadoop.hbase.regionserver.MemStoreFlusher: Flush thread woke up with memory above low water.
+So what we have is memstores initially being forced to flush because of minor heap pressure (adds storefiles faster than we can compact). Then we have memstores delaying flushes because of too many storefiles (memstores start getting bigger - our graph spike). Then the write ahead log (WAL) complains about too many of its logs, which forces a memstore flush (so that the WAL HLog can be safely discarded - this again adds storefiles).  And for good measure the flushing thread now wakes up, finds its out of heap, and starts attempting flushes, which just aggravates the problem (adding more storefiles to the pile). The failure doesn't happen immediately but we're past the point of no return - by about 13:00 the memstores are getting to the "memstore blocking limit" and our mappers die.
+
+What's left?
+
+Knowing what's going on in the memstore flush size analysis is comforting, but just reinforces what we already knew - the problem is too many storefiles. So what's left?  Raising the max number of storefiles, that's what! Every storefile in a store consumes resources (file handles, xceivers, heap for holding metadata), which is why it's limited to a maximum of a very modest 7 files by default. But for us this level of write load is rare - in normal operations we won't hit anything like this, and having the capacity to write a whole bunch of storefiles over short-ish, infrequent bursts is relatively safe, since we know our nightly major compaction will clean them up again (and thereby free up all those extra resources). Crank that maximum up to 200 and, finally, the process works!
+
+Conclusion
+Our problem was that our compactions couldn't keep up with all the storefiles we were creating. We tried turning all the different HBase dials to get the storefile/compaction process to work "like they're supposed to", but in the end the key for us was the hbase.hstore.blockingStoreFiles parameter which we set to 200, which is probably double what we actually needed but gives us buffer for our infrequent, larger write jobs. We additionally settled on larger (and therefore fewer) regions, and a somewhat bigger than default memstore. Here are the relevant pieces of our hbase-site.xml after all our testing:
+
+  <!-- default is 256MB 268435456, this is 1.5GB -->
+  <property>
+    <name>hbase.hregion.max.filesize</name>
+    <value>1610612736</value>
+  </property>
+  
+  <!-- default is 2 -->
+  <property>
+    <name>hbase.hregion.memstore.block.multiplier</name>
+    <value>4</value>
+  </property>
+  
+  <!-- default is 64MB 67108864 -->
+  <property>
+    <name>hbase.hregion.memstore.flush.size</name>
+    <value>134217728</value>
+  </property>
+  
+  <!-- default is 7, should be at least 2x compactionThreshold -->
+  <property>
+    <name>hbase.hstore.blockingStoreFiles</name>
+    <value>200</value>
+  </property>
+
+And finally, if our compactions were faster and/or more frequent, we might be able to keep up with our storefile creation. That doesn't look possible without multi-threaded compactions, but naturally those exist in newer versions of HBase (starting with 0.92 - HBASE-1476) so if you're having these problems, an upgrade might be in order. Indeed this is prompting us to consider an upgrade to CDH4.
+
+Many thanks to Lars George, who helped us get through the "Now What?" phase by digging deep into the logs and the source to help us work out what was going on.
+EINGESTELLT VON OLIVER MEYN UM 10:46
+LABELS: HADOOP
